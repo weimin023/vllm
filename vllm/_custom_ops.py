@@ -479,6 +479,45 @@ def rms_norm_per_block_quant(
     )
     return output, scales
 
+def silu_and_mul_per_block_quant_native(
+    input: torch.Tensor,
+    group_size: int,
+    quant_dtype: torch.dtype,
+    scale_ub: torch.Tensor | None = None,
+    is_scale_transposed: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """PyTorch-native implementation of fused SiLU + Mul + Block Quant."""
+    hidden_size = input.size(1) // 2
+    gate, up = input.split([hidden_size, hidden_size], dim=-1)
+
+    # SiLU(gate) * up
+    res = torch.nn.functional.silu(gate.to(torch.float32)) * up.to(torch.float32)
+
+    num_tokens = input.size(0)
+    num_groups = hidden_size // group_size
+    res_reshaped = res.view(num_tokens, num_groups, group_size)
+
+    # Calculate scales: max(abs(x)) / 448.0
+    max_vals, _ = torch.max(torch.abs(res_reshaped), dim=-1)
+    scales = max_vals / 448.0
+
+    if scale_ub is not None:
+        scales = torch.minimum(scales, scale_ub)
+
+    scales = torch.maximum(scales, torch.tensor(1e-10, device=input.device))
+
+    # Quantize
+    scales_expanded = scales.view(num_tokens, num_groups, 1).expand_as(
+        res_reshaped)
+    output = (res_reshaped / scales_expanded).to(quant_dtype).view(
+        num_tokens, hidden_size)
+
+    if is_scale_transposed:
+        scales = scales.t().contiguous()
+
+    return output, scales
+
+
 # fused silu_and_mul + block quant
 def silu_and_mul_per_block_quant(
     input: torch.Tensor,
@@ -495,14 +534,14 @@ def silu_and_mul_per_block_quant(
     # Output is half the width of input (after silu_and_mul)
     num_tokens = input.shape[0]
     hidden_size = input.shape[-1] // 2  # Divide by 2 because input is [gate || up]
-    
+
     # Allocate output tensor (FP8 or INT8)
     output = torch.empty(
         (num_tokens, hidden_size), 
-        device=input.device, 
+        device=input.device,
         dtype=quant_dtype
     )
-    
+
     # Allocate scales tensor
     num_groups = hidden_size // group_size  # Directly use group_size
     if is_scale_transposed:
@@ -517,7 +556,7 @@ def silu_and_mul_per_block_quant(
             device=input.device,
             dtype=torch.float32,
         )
-    
+
     # Call the C++ kernel
     torch.ops._C.silu_and_mul_per_block_quant(
         output,
@@ -527,7 +566,7 @@ def silu_and_mul_per_block_quant(
         scale_ub,
         is_scale_transposed,
     )
-    
+
     return output, scales
 
 # quantization ops
